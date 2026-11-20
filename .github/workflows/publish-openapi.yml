@@ -1,0 +1,68 @@
+name: publish-openapi
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tools/OpenApi/**'
+      - 'test/**'
+      - 'global.json'
+      - '.github/workflows/publish-openapi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-openapi
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: 'true'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE: 'true'
+
+jobs:
+  publish-openapi:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 11.0.100
+      - name: Generate OpenAPI document
+        run: dotnet run --project tools/OpenApi --configuration Release -- artifacts/openapi/openapi.json
+      - name: Test relay and API contract
+        run: dotnet test --project test/Soenneker.SignalR.Relay.Tests/Soenneker.SignalR.Relay.Tests.csproj --configuration Release
+      - name: Save generated document
+        uses: actions/upload-artifact@v7
+        with:
+          name: openapi
+          path: artifacts/openapi/openapi.json
+          if-no-files-found: error
+      - name: Checkout OpenAPI repository
+        uses: actions/checkout@v7
+        with:
+          repository: soenneker/soenneker.signalr.relay.openapi
+          ref: main
+          path: .openapi-repository
+          token: ${{ secrets.GH__TOKEN }}
+      - name: Publish changed document
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          cp artifacts/openapi/openapi.json .openapi-repository/openapi.json
+          cd .openapi-repository
+          git config user.name soenneker
+          git config user.email 4441470+soenneker@users.noreply.github.com
+          git add openapi.json
+          if git diff --cached --quiet; then
+            echo "OpenAPI document is unchanged."
+            exit 0
+          fi
+          git commit -m "Update OpenAPI from soenneker.signalr.relay@$SOURCE_SHA"
+          git push origin HEAD:main

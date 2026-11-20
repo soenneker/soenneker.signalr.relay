@@ -35,13 +35,13 @@ jobs:
           dotnet-version: 11.0.100
 
       - name: Restore tests
-        run: dotnet restore test/Soenneker.Cloudflare.SignalR.Tests/Soenneker.Cloudflare.SignalR.Tests.csproj --verbosity minimal
+        run: dotnet restore test/Soenneker.SignalR.Relay.Tests/Soenneker.SignalR.Relay.Tests.csproj --verbosity minimal
 
       - name: Build tests
-        run: dotnet build test/Soenneker.Cloudflare.SignalR.Tests/Soenneker.Cloudflare.SignalR.Tests.csproj --configuration Release --no-restore --verbosity minimal
+        run: dotnet build test/Soenneker.SignalR.Relay.Tests/Soenneker.SignalR.Relay.Tests.csproj --configuration Release --no-restore --verbosity minimal
 
       - name: Test
-        run: dotnet test --project test/Soenneker.Cloudflare.SignalR.Tests/Soenneker.Cloudflare.SignalR.Tests.csproj --configuration Release --no-build --no-restore --verbosity minimal
+        run: dotnet test --project test/Soenneker.SignalR.Relay.Tests/Soenneker.SignalR.Relay.Tests.csproj --configuration Release --no-build --no-restore --verbosity minimal
 
       - name: Build container
         run: docker build --platform linux/amd64 .

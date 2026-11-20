@@ -1,4 +1,4 @@
-# Soenneker.Cloudflare.SignalR
+# Soenneker.SignalR.Relay
 
 A .NET 11 relay for ASP.NET Core SignalR. The application hosts the hub and authorizes connections. The relay holds client transports and multiplexes them over outbound application-server WebSockets using Microsoft's service protocol.
 
@@ -7,7 +7,7 @@ A .NET 11 relay for ASP.NET Core SignalR. The application hosts the hub and auth
 Build the Linux image from the repository root.
 
 ```sh
-docker build --platform linux/amd64 -t soenneker/cloudflare-signalr:local .
+docker build --platform linux/amd64 -t soenneker/signalr-relay:local .
 ```
 
 The image listens on port 8080. Configure these environment variables in the container.
@@ -27,7 +27,7 @@ A Worker forwards negotiation, client transports, management requests and API tu
 
 `GET /health` checks the process. `GET /ready/apphub` returns 200 when the named hub has a client-capable API tunnel and 503 during cold start or shutdown. The Leadping deploy script accepts `--replica` to generate a second Worker, custom domain, container and secret binding. Both endpoints incur usage charges.
 
-The `Soenneker.Cloudflare.SignalR` .NET meter reports connected clients and server tunnels, output queue overflows, unsupported messages and retried invocation replies. A collector can subscribe to this meter. Client frames have a 1 MiB limit and each peer has a 4 MiB output budget. Client input shares at most 3 MiB of the API tunnel's queue, leaving capacity for control traffic.
+The `Soenneker.SignalR.Relay` .NET meter reports connected clients and server tunnels, output queue overflows, unsupported messages and retried invocation replies. A collector can subscribe to this meter. Client frames have a 1 MiB limit and each peer has a 4 MiB output budget. Client input shares at most 3 MiB of the API tunnel's queue, leaving capacity for control traffic.
 
 On Linux SIGTERM the relay marks hubs unready, rejects new client and server connections with HTTP 503, and continues serving admitted sessions until clients leave or the drain window expires. Under queue pressure the relay sheds backlogged clients. The meter reports queued bytes in `relay.output.queued_bytes` and pressure evictions in `relay.output.clients_shed`.
 
@@ -35,7 +35,7 @@ For key rotation, deploy the new current key and the previous key and restart th
 
 ## ASP.NET Core
 
-Register the `Soenneker.Cloudflare.SignalR.AspNetCore` package on each application server. Supply a service connection string of the form `Endpoint=https://relay.example.com;AccessKey=<secret>;Version=1.0;`. Existing browser and .NET clients continue connecting to the application's mapped hub.
+Register the `Soenneker.SignalR.Relay.AspNetCore` package on each application server. Supply a service connection string of the form `Endpoint=https://relay.example.com;AccessKey=<secret>;Version=1.0;`. Existing browser and .NET clients continue connecting to the application's mapped hub.
 
 ## Compatibility
 
