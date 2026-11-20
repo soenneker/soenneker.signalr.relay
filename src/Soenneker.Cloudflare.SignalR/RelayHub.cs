@@ -1,0 +1,491 @@
+using System.Buffers;
+using System.Collections.Concurrent;
+using Microsoft.Azure.SignalR.Protocol;
+
+namespace Soenneker.Cloudflare.SignalR;
+
+internal sealed class RelayHub
+{
+    private readonly RelayAudienceIndex _groups = new();
+    private readonly RelayAudienceIndex _users = new();
+    private readonly RelayUserGroups _userGroups;
+
+    public RelayHub() => _userGroups = new RelayUserGroups(_users, _groups);
+
+    private readonly Dictionary<string, RelayClient> _tokens = new(StringComparer.Ordinal);
+    private readonly List<RelayPeer> _servers = [];
+    private readonly ConcurrentDictionary<string, RelayClient> _clients = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string ClientId, string InvocationId), PendingInvocation> _invocations = [];
+    private readonly Dictionary<Guid, string> _sentOperations = [];
+    private readonly Queue<(Guid Id, DateTimeOffset Expires)> _sentExpiry = [];
+    private int _replyBytes;
+    private readonly Lock _gate = new();
+
+    public bool AllowsReconnect { get { lock (_gate) return _servers.Exists(s => s.AllowsReconnect); } }
+
+    public int ServerCount { get { lock (_gate) return _servers.Count; } }
+
+    public void Register(RelayPeer server)
+    {
+        lock (_gate) _servers.Add(server);
+        RelayMetrics.Servers.Add(1);
+    }
+
+    public void Remove(RelayPeer server)
+    {
+        lock (_gate)
+        {
+            if (_servers.Remove(server)) RelayMetrics.Servers.Add(-1);
+            foreach (var (key, pending) in _invocations)
+                if (pending.Caller == server) RemoveInvocation(key, out _);
+            foreach (var client in _clients.Values)
+                if (client.Server == server) Close(client.Peer.Id);
+        }
+    }
+
+    public RelayClient? Attach(RelayPeer peer, string protocol, string? user, OpenConnectionMessage open, RelayIdentity identity, bool resume = false)
+    {
+        lock (_gate)
+        {
+            var eligible = resume ? _servers.FindAll(s => s.AllowsReconnect) : _servers;
+            if (eligible.Count == 0) return null;
+            var preferred = open.Claims.FirstOrDefault(c => c.Type == "asrs.s.sn")?.Value;
+            var server = preferred is null ? null : eligible.FirstOrDefault(s => s.ServerId == preferred);
+            if (server is null && open.Claims.Any(c => c.Type == "asrs.s.ssticky" && c.Value == "Required")) return null;
+            server ??= eligible[Random.Shared.Next(eligible.Count)];
+            var client = new RelayClient(peer, server, protocol, user, identity);
+            if (_clients.ContainsKey(peer.Id) || (identity.Token.Length != 0 && !_tokens.TryAdd(identity.Token, client))) return null;
+            _clients[peer.Id] = client;
+            if (user is not null)
+            {
+                _users.Add(user, client);
+                _userGroups.Attach(client, user);
+            }
+            RelayMetrics.Clients.Add(1);
+            server.Send(open);
+            return client;
+        }
+    }
+
+    public void Detach(RelayClient client)
+    {
+        lock (_gate) RemoveClient(client.Peer.Id, abort: false);
+    }
+
+    public bool Contains(string id) => _clients.ContainsKey(id);
+
+    public int SendManaged(string? id, string? group, string? user, HashSet<string> excluded, byte[] json, ReadOnlyMemory<byte> binary, Guid? operation, string? fingerprint)
+    {
+        RelayClient[] recipients;
+        lock (_gate)
+        {
+            _userGroups.Expire(DateTimeOffset.UtcNow);
+            if (operation is { } key)
+            {
+                if (_sentOperations.TryGetValue(key, out var previous)) return previous == fingerprint ? 202 : 409;
+                if (_sentOperations.Count >= 65536) return 429;
+                if (id is not null && !_clients.ContainsKey(id)) return 404;
+                _sentOperations.Add(key, fingerprint!);
+                _sentExpiry.Enqueue((key, DateTimeOffset.UtcNow.AddMinutes(5)));
+            }
+            IEnumerable<RelayClient> clients = _clients.Values;
+            if (id is not null) clients = _clients.TryGetValue(id, out var client) ? [client] : [];
+            else if (group is not null) clients = _groups.Members(group);
+            else if (user is not null) clients = _users.Members(user);
+            recipients = clients.Where(c => !excluded.Contains(c.Peer.Id)).ToArray();
+        }
+        foreach (var client in recipients)
+            client.Peer.Send(client.Protocol == "json" ? json : binary);
+        return 202;
+    }
+
+    public bool ContainsGroup(string name)
+    {
+        lock (_gate) return _groups.Contains(name);
+    }
+
+    public bool ContainsUser(string id)
+    {
+        lock (_gate) return _users.Contains(id);
+    }
+
+    public bool Close(string id)
+    {
+        lock (_gate) return RemoveClient(id, abort: true);
+    }
+
+    private bool RemoveClient(string id, bool abort)
+    {
+        if (!_clients.TryRemove(id, out var client)) return false;
+        foreach (var waiter in client.ManagementResults.Values) waiter.TrySetException(new IOException("Client disconnected."));
+        if (abort) client.Peer.Abort();
+        if (client.Identity.Token.Length != 0) _tokens.Remove(client.Identity.Token);
+        if (client.UserId is not null) _users.Remove(client.UserId, client);
+        foreach (var group in client.Groups.Keys) _groups.Remove(group, client);
+        RelayMetrics.Clients.Add(-1);
+        client.Server.Send(new CloseConnectionMessage(id));
+        return true;
+    }
+
+    public void Dispatch(RelayPeer server, ServiceMessage message)
+    {
+        switch (message)
+        {
+            case ConnectionDataMessage data:
+                if (_clients.TryGetValue(data.ConnectionId, out var c)) c.Peer.Send(data.Payload.ToArray());
+                break;
+            case ClientInvocationMessage invocation:
+                lock (_gate)
+                {
+                    if (!_clients.TryGetValue(invocation.ConnectionId, out var receiver) ||
+                        !invocation.Payloads.TryGetValue(receiver.Protocol, out var bytes) || _invocations.Count >= 8192)
+                    {
+                        server.Send(new ErrorCompletionMessage(invocation.InvocationId, invocation.ConnectionId, invocation.CallerServerId, "Client unavailable."));
+                        break;
+                    }
+                    if (!_invocations.TryAdd((invocation.ConnectionId, invocation.InvocationId),
+                        new PendingInvocation(server, invocation.CallerServerId, DateTimeOffset.UtcNow.AddMinutes(2), receiver))) break;
+                    Interlocked.Increment(ref receiver.OutstandingInvocations);
+                    if (receiver.Server.ServerId != server.ServerId)
+                    {
+                        receiver.Server.Send(invocation);
+                        server.Send(new ServiceMappingMessage(invocation.InvocationId, invocation.ConnectionId, receiver.Server.Id));
+                    }
+                    receiver.Peer.Send(bytes.ToArray());
+                }
+                break;
+            case ClientCompletionMessage completion:
+                lock (_gate)
+                {
+                    var key = (completion.ConnectionId, completion.InvocationId);
+                    if (!_invocations.TryGetValue(key, out var pending)) break;
+                    if (completion.Payload.IsEmpty) RemoveInvocation(key, out _); // Caller SDK has consumed its result.
+                    else pending.Caller.Send(completion); // Routed results have no receipt; retain the bounded reply for recovery.
+                }
+                break;
+            case MulticastDataMessage multicast:
+                var filter = string.IsNullOrEmpty(multicast.Filter) ? null : SubscriberFilter.Parse(multicast.Filter);
+                if (!string.IsNullOrEmpty(multicast.Filter) && filter is null)
+                {
+                    // A filter is an audience restriction. Discard the whole send if it cannot be evaluated.
+                    RelayMetrics.UnsupportedMessages.Add(1);
+                    break;
+                }
+                var encoded = multicast.Payloads.ToDictionary(p => p.Key, p => p.Value.ToArray());
+                foreach (var client in Recipients(multicast))
+                    if ((filter is null || filter(client)) && encoded.TryGetValue(client.Protocol, out var payload))
+                        client.Peer.Send(payload);
+                break;
+            case UserJoinGroupWithAckMessage join:
+                lock (_gate) server.Send(new AckMessage(join.AckId, _userGroups.Join(join.UserId, join.GroupName, join.Ttl) ? 1 : 4));
+                break;
+            case UserJoinGroupMessage join:
+                lock (_gate) _userGroups.Join(join.UserId, join.GroupName, join.Ttl);
+                break;
+            case UserLeaveGroupWithAckMessage leave:
+                lock (_gate) _userGroups.Leave(leave.UserId, leave.GroupName);
+                server.Send(new AckMessage(leave.AckId, 1));
+                break;
+            case UserLeaveGroupMessage leave:
+                lock (_gate) _userGroups.Leave(leave.UserId, leave.GroupName);
+                break;
+            case CheckUserInGroupWithAckMessage check:
+                lock (_gate)
+                {
+                    _userGroups.Expire(DateTimeOffset.UtcNow);
+                    bool member = _userGroups.Contains(check.UserId, check.GroupName) || _users.Members(check.UserId).Any(c => c.Groups.ContainsKey(check.GroupName));
+                    server.Send(new AckMessage(check.AckId, member ? 1 : 2));
+                }
+                break;
+            case GroupMemberQueryMessage query:
+                server.Send(ListMembers(query));
+                break;
+            case JoinGroupMessage join:
+                JoinGroup(join.ConnectionId, join.GroupName);
+                break;
+            case LeaveGroupMessage leave:
+                LeaveGroup(leave.ConnectionId, leave.GroupName);
+                break;
+            case JoinGroupWithAckMessage join:
+                bool joined = JoinGroup(join.ConnectionId, join.GroupName);
+                server.Send(new AckMessage(join.AckId, joined ? 1 : 2));
+                break;
+            case LeaveGroupWithAckMessage leave:
+                LeaveGroup(leave.ConnectionId, leave.GroupName);
+                server.Send(new AckMessage(leave.AckId, 1));
+                break;
+            case CloseConnectionMessage close:
+                Close(close.ConnectionId);
+                break;
+#pragma warning disable CS0618 // Older SDK clients still send this wire message.
+            case CloseConnectionWithAckMessage close:
+                server.Send(new AckMessage(close.AckId, Close(close.ConnectionId) ? 1 : 2));
+                break;
+            case CloseMultiConnectionsWithAckMessage close:
+                lock (_gate)
+                {
+                    IEnumerable<RelayClient> targets = close switch
+                    {
+                        CloseUserConnectionsWithAckMessage u => _users.Members(u.UserId),
+                        CloseGroupConnectionsWithAckMessage g => _groups.Members(g.GroupName),
+                        CloseConnectionsWithAckMessage => _clients.Values,
+                        _ => []
+                    };
+                    var exclusions = close.ExcludedList.ToHashSet(StringComparer.Ordinal);
+                    foreach (var target in targets.Where(c => !exclusions.Contains(c.Peer.Id)).ToArray())
+                        RemoveClient(target.Peer.Id, abort: true);
+                }
+                server.Send(new AckMessage(close.AckId, 1));
+                break;
+#pragma warning restore CS0618
+            case CheckConnectionExistenceWithAckMessage check:
+                server.Send(new AckMessage(check.AckId, Contains(check.ConnectionId) ? 1 : 2));
+                break;
+            case GetConnectionClaimsMessage read:
+                lock (_gate)
+                {
+                    var current = ByToken(read.ConnectionToken);
+                    server.Send(current?.Identity.Read(read.AckId) ?? new AckMessage(read.AckId, 2));
+                }
+                break;
+            case RefreshAuthMessage refresh:
+                lock (_gate)
+                {
+                    var current = ByToken(refresh.ConnectionToken);
+                    server.Send(current?.Identity.Refresh(refresh, current) ?? new AckMessage(refresh.AckId, 2));
+                }
+                break;
+            case CheckGroupExistenceWithAckMessage group:
+                lock (_gate) server.Send(new AckMessage(group.AckId, _groups.Contains(group.GroupName) ? 1 : 2));
+                break;
+            case CheckUserExistenceWithAckMessage user:
+                lock (_gate) server.Send(new AckMessage(user.AckId, _users.Contains(user.UserId) ? 1 : 2));
+                break;
+            case PingMessage ping:
+                for (int i = 0; i + 1 < ping.Messages.Length; i += 2)
+                {
+                    if (ping.Messages[i] != "shutdown") continue;
+                    switch (ping.Messages[i + 1])
+                    {
+                        case "fin:0":
+                        case "fin:1":
+                            Remove(server);
+                            break;
+                        case "fin:2":
+                            // Stop admitting clients; existing calls and result waiters retain their tunnel until it closes.
+                            lock (_gate)
+                                if (_servers.Remove(server)) RelayMetrics.Servers.Add(-1);
+                            break;
+                        default: continue;
+                    }
+                    server.Send(new PingMessage { Messages = ["shutdown", "finack"] });
+                }
+                if (ping.Messages.Contains("echo")) server.Send(ping);
+                if (ping.Messages.Contains("status")) server.Send(new PingMessage { Messages = ["status", _clients.IsEmpty ? "0" : "1"] });
+                break;
+            case IAckableMessage ack:
+                server.Send(new AckMessage(ack.AckId, 4, "Unsupported relay operation."));
+                break;
+            default:
+                RelayMetrics.UnsupportedMessages.Add(1);
+                break;
+        }
+    }
+
+    public async Task<IResult> InvokeManaged(HttpContext http, string connectionId, string invocationId, byte[] json,
+        ReadOnlyMemory<byte> binary, Guid? operation, string? fingerprint)
+    {
+        Task<byte[]> result;
+        lock (_gate)
+        {
+            if (!_clients.TryGetValue(connectionId, out var client)) return Results.NotFound();
+            var now = DateTimeOffset.UtcNow;
+            if (operation is { } key && client.RetryableResults.TryGetValue(key, out var prior) && prior.Expires > now)
+            {
+                if (prior.Fingerprint != fingerprint) return Results.Conflict();
+                result = prior.Reply;
+            }
+            else
+            {
+                foreach (var (id, entry) in client.RetryableResults)
+                    if (entry.Expires <= now) client.RetryableResults.Remove(id);
+                if (client.ManagementResults.Count >= 64 || (operation.HasValue && client.RetryableResults.Count >= 64)) return Results.StatusCode(429);
+                var waiter = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                client.ManagementResults.Add(invocationId, waiter);
+                Interlocked.Increment(ref client.OutstandingInvocations);
+                result = WaitForCompletion(client, invocationId, waiter.Task, operation.HasValue);
+                if (operation.HasValue)
+                    client.RetryableResults.Add(operation.Value, new CachedClientResult(fingerprint!, now.AddMinutes(5), result));
+                client.Peer.Send(client.Protocol == "json" ? json : binary);
+            }
+        }
+        try
+        {
+            var frame = await result.WaitAsync(http.RequestAborted);
+            http.Response.Headers["X-ASRS-Protocol"] = "json";
+            return Results.Bytes(frame, "application/octet-stream");
+        }
+        catch (TimeoutException) { return Results.StatusCode(504); }
+        catch (InvalidDataException) { return Results.StatusCode(413); }
+        catch (IOException) { return Results.StatusCode(410); }
+    }
+
+    private async Task<byte[]> WaitForCompletion(RelayClient client, string id, Task<byte[]> completion, bool retryable)
+    {
+        try
+        {
+            var bytes = await completion.WaitAsync(TimeSpan.FromSeconds(30));
+            if (retryable && bytes.Length > 16 * 1024) throw new InvalidDataException("Retryable result exceeds the retention limit.");
+            return bytes;
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                client.ManagementResults.Remove(id);
+                Interlocked.Decrement(ref client.OutstandingInvocations);
+            }
+        }
+    }
+
+    public bool CompleteManaged(RelayClient client, string id, ReadOnlySequence<byte> frame, ReadOnlySequence<byte> body)
+    {
+        if (!id.StartsWith("cf:", StringComparison.Ordinal)) return false;
+        lock (_gate)
+        {
+            if (client.ManagementResults.TryGetValue(id, out var waiter))
+                waiter.TrySetResult(client.Protocol == "json" ? frame.ToArray() : ClientFrame.JsonCompletion(body, id));
+        }
+        return true;
+    }
+
+    public void RememberCompletion(RelayClient client, string id, ReadOnlySequence<byte> frame)
+    {
+        lock (_gate)
+        {
+            if (!_invocations.TryGetValue((client.Peer.Id, id), out var pending) || pending.Reply is not null) return;
+            if (_replyBytes + frame.Length > 8 * 1024 * 1024)
+            {
+                RemoveInvocation((client.Peer.Id, id), out _);
+                pending.Caller.Send(new ErrorCompletionMessage(id, client.Peer.Id, pending.CallerId, "Result buffer at capacity."));
+                return;
+            }
+            pending.Reply = frame.ToArray();
+            _replyBytes += pending.Reply.Length;
+            pending.RetryAfter = DateTimeOffset.UtcNow.AddMilliseconds(250);
+        }
+    }
+
+    public void Maintain(DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            _userGroups.Expire(now);
+            while (_sentExpiry.TryPeek(out var op) && op.Expires <= now) _sentOperations.Remove(_sentExpiry.Dequeue().Id);
+            foreach (var (key, pending) in _invocations)
+            {
+                if (pending.Deadline <= now || !_clients.ContainsKey(key.ClientId))
+                {
+                    RemoveInvocation(key, out _);
+                    pending.Caller.Send(new ErrorCompletionMessage(key.InvocationId, key.ClientId, pending.CallerId, "Invocation ended."));
+                }
+                else if (pending.Reply is { } reply && pending.RetryAfter <= now)
+                {
+                    // SDK 1.34 can receive a result before its caller registers the invocation. Send only
+                    // the captured completion back to the caller. Never execute the client method again.
+                    RelayMetrics.RecoveredReplies.Add(1);
+                    pending.Caller.Send(new ClientCompletionMessage(key.InvocationId, key.ClientId, pending.CallerId, pending.Receiver.Protocol, reply));
+                    // The stock SDK has no receipt for routed completions. Bound both retries and retention.
+                    // Repeating the result cannot execute the client method or complete its task twice.
+                    pending.RecoveryAttempts++;
+                    if (pending.RecoveryAttempts >= 3) RemoveInvocation(key, out _);
+                    else pending.RetryAfter = now.AddSeconds(pending.RecoveryAttempts == 1 ? 1 : 4);
+                }
+            }
+        }
+    }
+
+    private bool RemoveInvocation((string ClientId, string InvocationId) key, out PendingInvocation? pending)
+    {
+        if (!_invocations.Remove(key, out pending)) return false;
+        Interlocked.Decrement(ref pending.Receiver.OutstandingInvocations);
+        _replyBytes -= pending.Reply?.Length ?? 0;
+        return true;
+    }
+
+    public bool JoinGroup(string connectionId, string group)
+    {
+        lock (_gate)
+        {
+            if (!_clients.TryGetValue(connectionId, out var client)) return false;
+            _groups.Add(group, client);
+            client.Groups[group] = 0;
+            return true;
+        }
+    }
+
+    public void LeaveGroup(string connectionId, string? group)
+    {
+        lock (_gate)
+        {
+            if (!_clients.TryGetValue(connectionId, out var client)) return;
+            if (group is null)
+            {
+                foreach (var name in client.Groups.Keys) _groups.Remove(name, client);
+                client.Groups.Clear();
+            }
+            else
+            {
+                _groups.Remove(group, client);
+                client.Groups.TryRemove(group, out _);
+            }
+        }
+    }
+
+    private AckMessage ListMembers(GroupMemberQueryMessage query)
+    {
+        if (query.Top is <= 0 || query.MaxPageSize is <= 0 or > 200) return new AckMessage(query.AckId, 4);
+        var limit = Math.Min(query.MaxPageSize ?? 100, query.Top ?? int.MaxValue);
+        lock (_gate)
+        {
+            _userGroups.Expire(DateTimeOffset.UtcNow);
+            var page = _groups.Members(query.GroupName).Where(c => string.CompareOrdinal(c.Peer.Id, query.ContinuationToken) > 0)
+                .OrderBy(c => c.Peer.Id, StringComparer.Ordinal).Take(limit + 1).ToArray();
+            var buffer = new ArrayBufferWriter<byte>();
+            var writer = new MessagePack.MessagePackWriter(buffer);
+            writer.WriteArrayHeader(2);
+            writer.WriteArrayHeader(Math.Min(page.Length, limit));
+            foreach (var member in page.Take(limit))
+            {
+                writer.WriteArrayHeader(2);
+                writer.Write(member.Peer.Id);
+                writer.Write(member.UserId);
+            }
+            writer.Write(page.Length > limit && query.Top != limit ? page[limit - 1].Peer.Id : null);
+            writer.Flush();
+            return new AckMessage(query.AckId, 1) { Payload = new ReadOnlySequence<byte>(buffer.WrittenMemory) };
+        }
+    }
+
+    private RelayClient? ByToken(string token) => _tokens.GetValueOrDefault(token);
+
+    private RelayClient[] Recipients(MulticastDataMessage message)
+    {
+        lock (_gate)
+        {
+            _userGroups.Expire(DateTimeOffset.UtcNow);
+            IEnumerable<RelayClient> clients = message switch
+            {
+                BroadcastDataMessage b => _clients.Values.Where(c => !b.ExcludedList.Contains(c.Peer.Id)),
+                GroupBroadcastDataMessage g => _groups.Members(g.GroupName).Where(c =>
+                    !g.ExcludedList.Contains(c.Peer.Id) && (c.UserId is null || !g.ExcludedUserList.Contains(c.UserId))),
+                MultiGroupBroadcastDataMessage g => g.GroupList.SelectMany(_groups.Members).Distinct(),
+                UserDataMessage u => _users.Members(u.UserId),
+                MultiUserDataMessage u => u.UserList.Distinct().SelectMany(_users.Members),
+                MultiConnectionDataMessage m => m.ConnectionList.Distinct().Select(id => _clients.GetValueOrDefault(id)).OfType<RelayClient>(),
+                _ => []
+            };
+            return clients.ToArray();
+        }
+    }
+}
