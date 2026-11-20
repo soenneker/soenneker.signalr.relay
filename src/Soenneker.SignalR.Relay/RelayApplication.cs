@@ -7,7 +7,7 @@ using Soenneker.SignalR.Relay.Abstract;
 
 namespace Soenneker.SignalR.Relay;
 
-/// <summary>Builds the HTTP and WebSocket host for the SignalR relay relay.</summary>
+/// <summary>Builds the HTTP and WebSocket host for the SignalR relay.</summary>
 public static class RelayApplication
 {
     /// <summary>Creates a host configured from command-line arguments and environment variables.</summary>

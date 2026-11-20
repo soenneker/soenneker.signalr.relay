@@ -11,12 +11,12 @@
         <Features>$(Features);runtime-async=on</Features>
     </PropertyGroup>
     <PropertyGroup>
-        <Description>Cloudflare container hosting for ASP.NET Core SignalR</Description>
+        <Description>Containerized relay for ASP.NET Core SignalR</Description>
         <Version Condition="'$(BUILD_VERSION)' == ''">11.0.0</Version>
         <Version Condition="'$(BUILD_VERSION)' != ''">$(BUILD_VERSION)</Version>
         <AssemblyName>Soenneker.SignalR.Relay</AssemblyName>
         <PackageId>Soenneker.SignalR.Relay</PackageId>
-        <PackageTags>cloudflare signalr websockets cloudflaresignalr library csharp dotnet c# .net</PackageTags>
+        <PackageTags>signalr websockets signalrrelay library csharp dotnet c# .net</PackageTags>
         <Copyright>Copyright © 2026 Jake Soenneker</Copyright>
         <Authors>Jake Soenneker</Authors>
         <Company>https://soenneker.com</Company>

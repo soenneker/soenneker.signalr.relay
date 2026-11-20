@@ -77,7 +77,7 @@ foreach (var endpoint in endpoints)
 }
 var document = new {
     openapi = "3.0.3",
-    info = new { title = "SignalR relay Relay Management", version = "1.0.0" },
+    info = new { title = "SignalR Relay Management", version = "1.0.0" },
     paths,
     components = new {
         securitySchemes = new { bearer = new { type = "http", scheme = "bearer", bearerFormat = "JWT", description = "HS256 or HS512 JWT with issuer azure-signalr and an audience matching the relay scheme, host and escaped request path. Omit the port and query." } },
