@@ -33,6 +33,11 @@ jobs:
         run: dotnet test --project test/Soenneker.SignalR.Relay.Tests/Soenneker.SignalR.Relay.Tests.csproj --configuration Release
       - name: Build image
         run: docker build --platform linux/amd64 -t "$IMAGE:sha-${{ github.sha }}" .
+      - name: Verify candidate image with the latest published adapter
+        uses: soenneker/soenneker.signalr.relay.aspnetcore/test/WireCompatibility@main
+        with:
+          image: soenneker/signalr-relay:sha-${{ github.sha }}
+          published-adapter: 'true'
       - name: Log in to Docker Hub
         env:
           REGISTRY_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
